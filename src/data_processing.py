@@ -480,167 +480,198 @@ class DataCleaner(BaseEstimator, TransformerMixin):
 
 
 # =============================================================================
-# 8. FULL PIPELINE BUILDER
+# 7. CUSTOMER-LEVEL AGGREGATOR (wraps Tasks 3 & 4 for Pipeline)
+# =============================================================================
+
+class CustomerLevelAggregator(BaseEstimator, TransformerMixin):
+    """
+    Takes raw transaction-level DataFrame and produces a customer-level
+    DataFrame with engineered features + is_high_risk proxy target.
+    """
+    def __init__(self, snapshot_date=None, n_clusters=3, random_state=42):
+        self.snapshot_date = snapshot_date
+        self.n_clusters = n_clusters
+        self.random_state = random_state
+        self.agg_engineer_ = None
+        self.temporal_engineer_ = None
+        self.cat_aggregator_ = None
+        self.rfm_calc_ = None
+        self.risk_assigner_ = None
+
+    def fit(self, X, y=None):
+        self.agg_engineer_ = AggregateFeatureEngineer()
+        self.temporal_engineer_ = TemporalFeatureEngineer()
+        self.cat_aggregator_ = CategoricalAggregator()
+        self.rfm_calc_ = RFMCalculator(snapshot_date=self.snapshot_date)
+        self.risk_assigner_ = RiskLabelAssigner(
+            n_clusters=self.n_clusters, random_state=self.random_state
+        )
+        return self
+
+    def transform(self, X):
+        # Run all aggregators in parallel on raw data
+        agg = self.agg_engineer_.fit_transform(X)
+        temporal = self.temporal_engineer_.fit_transform(X)
+        cat = self.cat_aggregator_.fit_transform(X)
+        rfm = self.rfm_calc_.fit_transform(X)
+
+        # Merge on CustomerId
+        customer_df = agg.merge(temporal, on="CustomerId", how="outer")
+        customer_df = customer_df.merge(cat, on="CustomerId", how="outer")
+        customer_df = customer_df.merge(rfm, on="CustomerId", how="outer")
+
+        # Clean: drop constants, handle inf
+        cleaner = DataCleaner()
+        customer_df = cleaner.fit_transform(customer_df)
+
+        # Defensive imputation for any remaining NaNs
+        num_cols = customer_df.select_dtypes(include=[np.number]).columns.tolist()
+        num_cols = [c for c in num_cols if c != "CustomerId"]
+        for col in num_cols:
+            if customer_df[col].isnull().any():
+                customer_df[col] = customer_df[col].fillna(customer_df[col].median())
+
+        # Assign risk labels via K-Means on RFM
+        customer_df = self.risk_assigner_.fit_transform(customer_df)
+        return customer_df
+
+
+# =============================================================================
+# 8. POST-PROCESSING TRANSFORMER (WoE + Scaling)
+# =============================================================================
+
+class PostProcessTransformer(BaseEstimator, TransformerMixin):
+    """
+    Applies WoE binning and StandardScaler to the customer-level DataFrame.
+    Must be fit AFTER CustomerLevelAggregator because it needs the target column.
+    """
+    def __init__(self, apply_woe=True, apply_scaler=True, n_bins=10):
+        self.apply_woe = apply_woe
+        self.apply_scaler = apply_scaler
+        self.n_bins = n_bins
+        self.woe_transformer_ = None
+        self.scaler_ = None
+        self.feature_names_ = None
+
+    def fit(self, X, y=None):
+        X = X.copy()
+
+        # Identify candidate columns for WoE (numeric, not target/id/cluster, enough unique values)
+        num_cols = X.select_dtypes(include=[np.number]).columns.tolist()
+        exclude = {"CustomerId", "cluster", "is_high_risk"}
+        woe_candidates = [
+            c for c in num_cols
+            if c not in exclude and X[c].nunique() > 5
+        ]
+
+        if self.apply_woe and woe_candidates:
+            self.woe_transformer_ = WoETransformer(
+                columns=woe_candidates[:10],  # Top 10 to avoid bloat
+                target_col="is_high_risk",
+                n_bins=self.n_bins,
+            )
+            X = self.woe_transformer_.fit_transform(X)
+
+        # Drop non-numeric columns before scaling
+        self.feature_names_ = [
+            c for c in X.columns
+            if c not in exclude and pd.api.types.is_numeric_dtype(X[c])
+        ]
+
+        if self.apply_scaler and self.feature_names_:
+            self.scaler_ = StandardScaler()
+            self.scaler_.fit(X[self.feature_names_])
+
+        return self
+
+    def transform(self, X):
+        X = X.copy()
+
+        if self.woe_transformer_ is not None:
+            X = self.woe_transformer_.transform(X)
+
+        if self.scaler_ is not None and self.feature_names_:
+            X[self.feature_names_] = self.scaler_.transform(X[self.feature_names_])
+
+        return X
+
+
+# =============================================================================
+# 9. FULL PIPELINE BUILDER
 # =============================================================================
 
 def build_processing_pipeline(
-    snapshot_date: Optional[str] = None,
-    n_clusters: int = 3,
-) -> Pipeline:
+    snapshot_date=None,
+    n_clusters=3,
+    apply_woe=True,
+    apply_scaler=True,
+    random_state=42,
+):
     """
-    Build the complete sklearn Pipeline for Tasks 3 & 4.
-    
-    Note: This pipeline handles the full flow from raw transactions to
-    customer-level model-ready data. Because aggregation changes the
-    DataFrame shape, we use a custom orchestration function rather than
-    a pure sklearn Pipeline for the aggregation step.
-    """
-    # The aggregation and RFM steps are done in process_data() below.
-    # This pipeline handles the post-aggregation preprocessing.
-    pass
+    Build a proper sklearn Pipeline that transforms raw transactions into
+    a model-ready customer-level DataFrame.
 
+    The pipeline chains:
+        1. CustomerLevelAggregator  -> raw txns to customer features + is_high_risk
+        2. PostProcessTransformer   -> WoE + StandardScaler
+
+    Returns
+    -------
+    sklearn.pipeline.Pipeline
+        Fitted pipeline that can be reused in training and serving.
+    """
+    steps = [
+        (
+            "aggregator",
+            CustomerLevelAggregator(
+                snapshot_date=snapshot_date,
+                n_clusters=n_clusters,
+                random_state=random_state,
+            ),
+        ),
+        (
+            "postprocess",
+            PostProcessTransformer(
+                apply_woe=apply_woe,
+                apply_scaler=apply_scaler,
+            ),
+        ),
+    ]
+
+    pipeline = Pipeline(steps)
+    return pipeline
+
+
+# =============================================================================
+# 10. PROCESS DATA (uses the Pipeline)
+# =============================================================================
 
 def process_data(
     raw_df: pd.DataFrame,
-    snapshot_date: Optional[str] = None,
-    n_clusters: int = 3,
-    apply_woe: bool = True,
+    snapshot_date=None,
+    n_clusters=3,
+    apply_woe=True,
+    apply_scaler=True,
+    random_state=42,
 ) -> pd.DataFrame:
     """
-    Main orchestration function.
-    
-    Takes raw transaction-level DataFrame and returns customer-level,
-    model-ready DataFrame with is_high_risk target and engineered features.
-    
-    Parameters
-    ----------
-    raw_df : pd.DataFrame
-        Raw Xente transaction data
-    snapshot_date : str, optional
-        Snapshot date for recency calculation. Defaults to max date + 1 day.
-    n_clusters : int
-        Number of K-Means clusters for risk segmentation
-    apply_woe : bool
-        Whether to apply WoE transformation
-    
-    Returns
-    -------
-    pd.DataFrame
-        Processed customer-level dataset ready for modeling
+    Main entry point. Uses build_processing_pipeline() to ensure the
+    entire transformation is encapsulated in a single fitted Pipeline object.
     """
-    logger.info(f"Starting data processing pipeline on {raw_df.shape[0]:,} transactions")
+    logger.info(f"Starting pipeline processing on {raw_df.shape[0]:,} transactions")
 
-    # Step 1: Aggregate numerical features
-    agg_engineer = AggregateFeatureEngineer()
-    agg_features = agg_engineer.fit_transform(raw_df)
-
-    # Step 2: Temporal features
-    temporal_engineer = TemporalFeatureEngineer()
-    temporal_features = temporal_engineer.fit_transform(raw_df)
-
-    # Step 3: Categorical aggregation
-    cat_aggregator = CategoricalAggregator()
-    cat_features = cat_aggregator.fit_transform(raw_df)
-
-    # Step 4: Merge all customer-level features
-    customer_df = agg_features.merge(
-        temporal_features, on="CustomerId", how="outer"
-    ).merge(
-        cat_features, on="CustomerId", how="outer"
+    pipeline = build_processing_pipeline(
+        snapshot_date=snapshot_date,
+        n_clusters=n_clusters,
+        apply_woe=apply_woe,
+        apply_scaler=apply_scaler,
+        random_state=random_state,
     )
 
-    # Step 5: RFM calculation
-    rfm_calc = RFMCalculator(snapshot_date=snapshot_date)
-    rfm_features = rfm_calc.fit_transform(raw_df)
+    # Fit and transform in one call
+    processed = pipeline.fit_transform(raw_df)
 
-    # Step 6: Merge RFM into customer dataset
-    customer_df = customer_df.merge(rfm_features, on="CustomerId", how="outer")
+    logger.info(f"Pipeline complete. Output shape: {processed.shape}")
+    logger.info(f"Final columns: {list(processed.columns)}")
 
-    # Step 7: Data cleaning (drop constant columns, handle inf/nan)
-    cleaner = DataCleaner()
-    customer_df = cleaner.fit_transform(customer_df)
-
-    # Step 8: Defensive imputation for any remaining NaNs
-    # (EDA showed no missing values, but pipeline must be robust)
-    num_cols = customer_df.select_dtypes(include=[np.number]).columns.tolist()
-    num_cols = [c for c in num_cols if c != "CustomerId"]
-    
-    for col in num_cols:
-        if customer_df[col].isnull().any():
-            customer_df[col] = customer_df[col].fillna(customer_df[col].median())
-
-    # Step 9: Risk label assignment via K-Means (Task 4)
-    risk_assigner = RiskLabelAssigner(n_clusters=n_clusters, random_state=RANDOM_STATE)
-    customer_df = risk_assigner.fit_transform(customer_df)
-
-    # Step 10: WoE transformation (Task 3)
-    if apply_woe:
-        # Select numerical features for WoE (exclude ID, target, cluster)
-        woe_candidates = [
-            c for c in num_cols
-            if c not in ["recency", "frequency", "monetary", "log_monetary", "cluster", "is_high_risk"]
-            and customer_df[c].nunique() > 5  # Need enough variation to bin
-        ]
-        
-        if woe_candidates:
-            woe_transformer = WoETransformer(
-                columns=woe_candidates[:5],  # Limit to top 5 to avoid over-engineering
-                target_col="is_high_risk",
-                n_bins=10,
-            )
-            customer_df = woe_transformer.fit_transform(customer_df)
-            logger.info(f"WoE applied to columns: {woe_candidates[:5]}")
-
-    # Step 11: Final feature selection / ordering
-    # Drop raw high-cardinality IDs that are not model features
-    drop_cols = ["CustomerId"]  # Keep if needed for reference, but exclude from modeling
-    # Actually keep CustomerId for reference, drop only if explicitly requested
-
-    logger.info(f"Pipeline complete. Output shape: {customer_df.shape}")
-    logger.info(f"Final columns: {list(customer_df.columns)}")
-
-    return customer_df
-
-
-# =============================================================================
-# 9. UTILITY FUNCTIONS
-# =============================================================================
-
-def get_feature_columns(df: pd.DataFrame, target_col: str = "is_high_risk") -> List[str]:
-    """
-    Return list of feature columns suitable for model training.
-    Excludes target, cluster label, and ID columns.
-    """
-    exclude = {target_col, "cluster", "CustomerId"}
-    return [c for c in df.columns if c not in exclude]
-
-
-def split_features_target(
-    df: pd.DataFrame,
-    target_col: str = "is_high_risk",
-) -> Tuple[pd.DataFrame, pd.Series]:
-    """
-    Split processed DataFrame into X (features) and y (target).
-    """
-    features = get_feature_columns(df, target_col)
-    X = df[features]
-    y = df[target_col]
-    return X, y
-
-
-# =============================================================================
-# 10. MAIN EXECUTION
-# =============================================================================
-
-if __name__ == "__main__":
-    # Example usage (requires data/raw/data.csv)
-    import os
-
-    data_path = os.path.join("data", "raw", "data.csv")
-    if os.path.exists(data_path):
-        raw = pd.read_csv(data_path)
-        processed = process_data(raw)
-        processed.to_csv("data/processed/customer_features.csv", index=False)
-        logger.info("Processed data saved to data/processed/customer_features.csv")
-    else:
-        logger.warning(f"Data file not found at {data_path}. Run this after placing the dataset.")
+    return processed
