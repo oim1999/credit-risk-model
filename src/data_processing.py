@@ -633,10 +633,10 @@ def split_features_target(
 # =============================================================================
 
 if __name__ == "__main__":
-    # Example usage (requires data/raw/training.csv)
+    # Example usage (requires data/raw/data.csv)
     import os
 
-    data_path = os.path.join("data", "raw", "training.csv")
+    data_path = os.path.join("data", "raw", "data.csv")
     if os.path.exists(data_path):
         raw = pd.read_csv(data_path)
         processed = process_data(raw)
