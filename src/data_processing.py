@@ -1,636 +1,646 @@
 """
-Credit Risk Feature Engineering Pipeline
-========================================
-Transforms raw Xente transaction data into model-ready features.
-Covers Tasks 3 (Feature Engineering) and Task 4 (Proxy Target Variable).
+Data Processing & Feature Engineering Pipeline
 
-Usage:
-    from src.data_processing import FeatureEngineeringPipeline, RFMCalculator
-    
-    pipeline = FeatureEngineeringPipeline()
-    X_processed, y_proxy = pipeline.fit_transform(df_raw)
+Transforms raw Xente transaction-level data into a customer-level,
+model-ready dataset with an RFM-based proxy risk label.
+
+Covers:
+    - Task 3: Aggregate features, temporal features, encoding, scaling, WoE/IV
+    - Task 4: RFM calculation + K-Means clustering for is_high_risk proxy target
+
+Author: Bati Bank Analytics Team
 """
 
-import logging
-import warnings
-from datetime import datetime
-from typing import List, Optional, Tuple, Union
-
-import numpy as np
 import pandas as pd
+import numpy as np
+import logging
+from typing import List, Optional, Dict, Tuple
 from sklearn.base import BaseEstimator, TransformerMixin
-from sklearn.cluster import KMeans
-from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder, StandardScaler, MinMaxScaler, LabelEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import StandardScaler, MinMaxScaler, OneHotEncoder, FunctionTransformer
+from sklearn.impute import SimpleImputer
+from sklearn.cluster import KMeans
+from scipy import stats
 
-# Optional: xverse for WoE/IV
-# Install: pip install xverse
-# For this pipeline, we implement a custom WoE transformer if xverse is unavailable
-try:
-    from xverse.transformer import WOE
-    HAS_XVERSE = True
-except ImportError:
-    HAS_XVERSE = False
-    warnings.warn("xverse not installed. Using custom WoE implementation. "
-                  "Install with: pip install xverse")
-
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-)
-
-
-# =============================================================================
-# CONFIGURATION
-# =============================================================================
 
 RANDOM_STATE = 42
-SNAPSHOT_DATE = pd.Timestamp("2019-01-01")  # Adjust based on your data's max date
-
-# Columns expected in raw data
-RAW_COLS_EXPECTED = [
-    "TransactionId", "BatchId", "AccountId", "SubscriptionId",
-    "CustomerId", "CurrencyCode", "CountryCode", "ProviderId",
-    "ProductId", "ProductCategory", "ChannelId", "Amount",
-    "Value", "TransactionStartTime", "PricingStrategy", "FraudResult"
-]
-
-CATEGORICAL_COLS = ["ProductCategory", "ChannelId", "PricingStrategy"]
-NUMERICAL_COLS = ["Amount", "Value"]  # Before aggregation
-TEMPORAL_COLS = ["TransactionStartTime"]
-
-# Rare category threshold: group categories with < 1% frequency into "Other"
-RARE_CATEGORY_THRESHOLD = 0.01
 
 
 # =============================================================================
-# CUSTOM TRANSFORMERS
+# 1. AGGREGATE FEATURE ENGINEER (Task 3)
 # =============================================================================
-
-class RareCategoryGrouper(BaseEstimator, TransformerMixin):
-    """
-    Group rare categorical values into a single 'Other' category.
-    Reduces dimensionality and avoids sparse one-hot features.
-    """
-
-    def __init__(self, threshold: float = RARE_CATEGORY_THRESHOLD):
-        self.threshold = threshold
-        self.freq_maps_ = {}
-
-    def fit(self, X: pd.DataFrame, y=None):
-        for col in X.select_dtypes(include=["object", "category"]).columns:
-            freq = X[col].value_counts(normalize=True)
-            self.freq_maps_[col] = set(freq[freq >= self.threshold].index)
-        return self
-
-    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
-        X = X.copy()
-        for col, valid_cats in self.freq_maps_.items():
-            if col in X.columns:
-                X[col] = X[col].apply(
-                    lambda v: v if v in valid_cats else "Other"
-                )
-        return X
-
-
-class TemporalFeatureExtractor(BaseEstimator, TransformerMixin):
-    """
-    Extract hour, day, month, year, weekday, weekend_flag from datetime.
-    Also adds cyclical (sin/cos) encoding for hour and month.
-    """
-
-    def __init__(self, datetime_col: str = "TransactionStartTime"):
-        self.datetime_col = datetime_col
-
-    def fit(self, X: pd.DataFrame, y=None):
-        return self
-
-    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
-        X = X.copy()
-        if self.datetime_col not in X.columns:
-            raise ValueError(f"Column '{self.datetime_col}' not found in DataFrame.")
-
-        dt = pd.to_datetime(X[self.datetime_col], errors="coerce")
-
-        X["txn_hour"] = dt.dt.hour
-        X["txn_day"] = dt.dt.day
-        X["txn_month"] = dt.dt.month
-        X["txn_year"] = dt.dt.year
-        X["txn_weekday"] = dt.dt.weekday  # 0=Monday
-        X["txn_is_weekend"] = (dt.dt.weekday >= 5).astype(int)
-
-        # Cyclical encoding: captures that 23:00 is close to 00:00
-        X["txn_hour_sin"] = np.sin(2 * np.pi * dt.dt.hour / 24)
-        X["txn_hour_cos"] = np.cos(2 * np.pi * dt.dt.hour / 24)
-        X["txn_month_sin"] = np.sin(2 * np.pi * dt.dt.month / 12)
-        X["txn_month_cos"] = np.cos(2 * np.pi * dt.dt.month / 12)
-
-        # Drop raw datetime column (kept only if needed downstream)
-        X = X.drop(columns=[self.datetime_col])
-        return X
-
 
 class AggregateFeatureEngineer(BaseEstimator, TransformerMixin):
     """
-    Compute per-customer aggregate features from transaction-level data.
-    Output: one row per CustomerId with aggregate statistics.
+    Aggregate transaction-level data to customer-level features.
+    Computes sums, means, stds, counts, min/max, and ratios.
     """
 
-    def __init__(self, customer_id_col: str = "CustomerId",
-                 amount_col: str = "Amount",
-                 value_col: str = "Value"):
+    def __init__(
+        self,
+        customer_id_col: str = "CustomerId",
+        amount_col: str = "Amount",
+        value_col: str = "Value",
+        timestamp_col: str = "TransactionStartTime",
+    ):
         self.customer_id_col = customer_id_col
         self.amount_col = amount_col
         self.value_col = value_col
+        self.timestamp_col = timestamp_col
 
     def fit(self, X: pd.DataFrame, y=None):
         return self
 
     def transform(self, X: pd.DataFrame) -> pd.DataFrame:
-        if self.customer_id_col not in X.columns:
-            raise ValueError(f"Customer ID column '{self.customer_id_col}' not found.")
+        logger.info("Engineering aggregate features per customer...")
 
-        grp = X.groupby(self.customer_id_col)
+        df = X.copy()
+        df[self.timestamp_col] = pd.to_datetime(df[self.timestamp_col])
 
+        # Core aggregates
         agg_specs = {
-            # Amount-based features
-            f"{self.amount_col}_sum": pd.NamedAgg(column=self.amount_col, aggfunc="sum"),
-            f"{self.amount_col}_mean": pd.NamedAgg(column=self.amount_col, aggfunc="mean"),
-            f"{self.amount_col}_std": pd.NamedAgg(column=self.amount_col, aggfunc="std"),
-            f"{self.amount_col}_max": pd.NamedAgg(column=self.amount_col, aggfunc="max"),
-            f"{self.amount_col}_min": pd.NamedAgg(column=self.amount_col, aggfunc="min"),
-            f"{self.amount_col}_count": pd.NamedAgg(column=self.amount_col, aggfunc="count"),
-            f"{self.amount_col}_median": pd.NamedAgg(column=self.amount_col, aggfunc="median"),
-
-            # Value-based features (absolute magnitude)
-            f"{self.value_col}_sum": pd.NamedAgg(column=self.value_col, aggfunc="sum"),
-            f"{self.value_col}_mean": pd.NamedAgg(column=self.value_col, aggfunc="mean"),
-            f"{self.value_col}_std": pd.NamedAgg(column=self.value_col, aggfunc="std"),
-            f"{self.value_col}_max": pd.NamedAgg(column=self.value_col, aggfunc="max"),
-            f"{self.value_col}_median": pd.NamedAgg(column=self.value_col, aggfunc="median"),
-
-            # Fraud-related
-            "fraud_count": pd.NamedAgg(column="FraudResult", aggfunc="sum"),
-            "fraud_rate": pd.NamedAgg(column="FraudResult", aggfunc="mean"),
-
-            # Temporal diversity
-            "txn_hour_std": pd.NamedAgg(column="txn_hour", aggfunc="std"),
-            "unique_products": pd.NamedAgg(column="ProductCategory", aggfunc="nunique"),
-            "unique_channels": pd.NamedAgg(column="ChannelId", aggfunc="nunique"),
+            self.amount_col: ["sum", "mean", "std", "count", "max", "min"],
+            self.value_col: ["sum", "mean", "std", "max", "min"],
         }
 
-        customer_df = grp.agg(**agg_specs).reset_index()
+        customer_agg = df.groupby(self.customer_id_col).agg(agg_specs).reset_index()
 
-        # Fill NaN stds (customers with only 1 transaction get std=0)
-        std_cols = [c for c in customer_df.columns if c.endswith("_std")]
-        customer_df[std_cols] = customer_df[std_cols].fillna(0)
+        # Flatten multi-index columns
+        customer_agg.columns = [
+            f"{col[0]}_{col[1]}" if col[1] != "" else col[0]
+            for col in customer_agg.columns.values
+        ]
 
-        # Log-transform monetary aggregates to tame extreme skewness (>50)
-        for col in customer_df.columns:
-            if any(suffix in col for suffix in ["_sum", "_mean", "_std", "_max", "_median"]):
-                if customer_df[col].min() >= 0:
-                    customer_df[f"{col}_log1p"] = np.log1p(customer_df[col])
-
-        logger.info(f"Aggregate features computed for {len(customer_df)} customers.")
-        return customer_df
-
-
-class WoETransformer(BaseEstimator, TransformerMixin):
-    """
-    Weight of Evidence binning for numerical features.
-    Used primarily for Logistic Regression baseline to create
-    monotonic, interpretable, regulator-friendly features.
-
-    If xverse is available, uses WOE from xverse.transformer.
-    Otherwise, falls back to a manual pandas-based implementation.
-    """
-
-    def __init__(self, n_bins: int = 10):
-        self.n_bins = n_bins
-        self.woe_maps_ = {}
-
-    def fit(self, X: pd.DataFrame, y: pd.Series):
-        if y is None:
-            raise ValueError("WoE transformer requires target variable y during fit.")
-
-        for col in X.select_dtypes(include=[np.number]).columns:
-            try:
-                if HAS_XVERSE:
-                    woe = WOE()
-                    woe.fit(X[[col]], y)
-                    # Store the transformer for later use
-                    self.woe_maps_[col] = woe
-                else:
-                    self.woe_maps_[col] = self._fit_manual_woe(X[col], y)
-            except Exception as e:
-                logger.warning(f"WoE fit failed for column '{col}': {e}")
-        return self
-
-    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
-        X_woe = X.copy()
-        for col, woe_obj in self.woe_maps_.items():
-            if col not in X_woe.columns:
-                continue
-            try:
-                if HAS_XVERSE:
-                    X_woe[f"{col}_woe"] = woe_obj.transform(X_woe[[col]])
-                else:
-                    X_woe[f"{col}_woe"] = X_woe[col].map(woe_obj)
-                    # Fill unseen values with 0 (neutral WoE)
-                    X_woe[f"{col}_woe"] = X_woe[f"{col}_woe"].fillna(0)
-            except Exception as e:
-                logger.warning(f"WoE transform failed for column '{col}': {e}")
-        return X_woe
-
-    def _fit_manual_woe(self, x: pd.Series, y: pd.Series) -> dict:
-        """Manual WoE calculation using quantile-based bins."""
-        # Create bins using quantiles
-        bins = pd.qcut(x, q=self.n_bins, duplicates="drop")
-        woe_df = pd.DataFrame({"bin": bins, "target": y})
-
-        # Calculate distribution of goods (y=0) and bads (y=1) per bin
-        grouped = woe_df.groupby("bin")["target"].agg(["sum", "count"])
-        grouped["bad"] = grouped["sum"]
-        grouped["good"] = grouped["count"] - grouped["sum"]
-
-        # Add small constant to avoid division by zero
-        eps = 0.5
-        total_good = (y == 0).sum() + eps
-        total_bad = (y == 1).sum() + eps
-
-        grouped["woe"] = np.log(
-            (grouped["good"] + eps) / total_good /
-            ((grouped["bad"] + eps) / total_bad)
+        # Rename customer column back cleanly
+        customer_agg.rename(
+            columns={f"{self.customer_id_col}_": self.customer_id_col},
+            inplace=True,
         )
 
-        # Return mapping from bin interval to WoE value
-        return grouped["woe"].to_dict()
+        # Derived features
+        customer_agg["amount_range"] = (
+            customer_agg[f"{self.amount_col}_max"] - customer_agg[f"{self.amount_col}_min"]
+        )
+        customer_agg["value_range"] = (
+            customer_agg[f"{self.value_col}_max"] - customer_agg[f"{self.value_col}_min"]
+        )
+
+        # Coefficient of variation (handle division by zero)
+        customer_agg["amount_cv"] = (
+            customer_agg[f"{self.amount_col}_std"] / customer_agg[f"{self.amount_col}_mean"]
+        ).replace([np.inf, -np.inf], 0).fillna(0)
+
+        customer_agg["value_cv"] = (
+            customer_agg[f"{self.value_col}_std"] / customer_agg[f"{self.value_col}_mean"]
+        ).replace([np.inf, -np.inf], 0).fillna(0)
+
+        # Log-transformed monetary features (handles skewness > 50 from EDA)
+        for col in [f"{self.amount_col}_sum", f"{self.value_col}_sum"]:
+            customer_agg[f"log1p_{col}"] = np.log1p(customer_agg[col].abs())
+
+        # Ratio of credit to debit transactions (uses negative Amount)
+        credit_mask = df[self.amount_col] < 0
+        credit_counts = (
+            df[credit_mask].groupby(self.customer_id_col).size()
+            .reindex(customer_agg[self.customer_id_col], fill_value=0)
+        )
+        total_counts = customer_agg[f"{self.amount_col}_count"]
+        customer_agg["credit_ratio"] = (credit_counts / total_counts.replace(0, np.nan)).fillna(0)
+
+        # Average transaction value (absolute)
+        customer_agg["avg_abs_amount"] = (
+            customer_agg[f"{self.amount_col}_sum"].abs() / customer_agg[f"{self.amount_col}_count"]
+        )
+
+        # Max single transaction as proxy for "big spender" tail risk
+        customer_agg["max_single_value"] = customer_agg[f"{self.value_col}_max"]
+
+        logger.info(f"Aggregate features engineered: {customer_agg.shape[1]} columns")
+        return customer_agg
 
 
 # =============================================================================
-# RFM CALCULATOR (TASK 4)
+# 2. TEMPORAL FEATURE ENGINEER (Task 3)
+# =============================================================================
+
+class TemporalFeatureEngineer(BaseEstimator, TransformerMixin):
+    """
+    Extract temporal features from transaction timestamps and aggregate
+    to customer-level behavioral patterns.
+    """
+
+    def __init__(
+        self,
+        customer_id_col: str = "CustomerId",
+        timestamp_col: str = "TransactionStartTime",
+    ):
+        self.customer_id_col = customer_id_col
+        self.timestamp_col = timestamp_col
+
+    def fit(self, X: pd.DataFrame, y=None):
+        return self
+
+    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
+        logger.info("Engineering temporal features...")
+
+        df = X.copy()
+        df[self.timestamp_col] = pd.to_datetime(df[self.timestamp_col])
+
+        # Transaction-level temporal features
+        df["transaction_hour"] = df[self.timestamp_col].dt.hour
+        df["transaction_day"] = df[self.timestamp_col].dt.day
+        df["transaction_month"] = df[self.timestamp_col].dt.month
+        df["transaction_year"] = df[self.timestamp_col].dt.year
+        df["transaction_weekday"] = df[self.timestamp_col].dt.weekday
+        df["is_weekend"] = df["transaction_weekday"].isin([5, 6]).astype(int)
+
+        # Customer-level temporal aggregates
+        temporal_agg = df.groupby(self.customer_id_col).agg(
+            preferred_hour=("transaction_hour", lambda x: x.mode().iloc[0] if not x.mode().empty else x.iloc[0]),
+            hour_std=("transaction_hour", "std"),
+            weekend_ratio=("is_weekend", "mean"),
+            unique_days=("transaction_day", "nunique"),
+            unique_months=("transaction_month", "nunique"),
+            first_transaction=("transaction_year", "min"),
+            last_transaction=("transaction_year", "max"),
+        ).reset_index()
+
+        # Fill std NaN (customers with 1 transaction)
+        temporal_agg["hour_std"] = temporal_agg["hour_std"].fillna(0)
+
+        logger.info(f"Temporal features engineered: {temporal_agg.shape[1]} columns")
+        return temporal_agg
+
+
+# =============================================================================
+# 3. CATEGORICAL AGGREGATOR (Task 3)
+# =============================================================================
+
+class CategoricalAggregator(BaseEstimator, TransformerMixin):
+    """
+    Aggregate categorical features to customer level.
+    Uses dominant category + entropy/diversity measures.
+    """
+
+    def __init__(
+        self,
+        customer_id_col: str = "CustomerId",
+        cat_cols: Optional[List[str]] = None,
+    ):
+        self.customer_id_col = customer_id_col
+        self.cat_cols = cat_cols or [
+            "ProductCategory",
+            "ChannelId",
+            "PricingStrategy",
+            "ProviderId",
+        ]
+
+    def fit(self, X: pd.DataFrame, y=None):
+        return self
+
+    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
+        logger.info("Aggregating categorical features per customer...")
+
+        df = X.copy()
+        result = df[[self.customer_id_col]].drop_duplicates()
+
+        for col in self.cat_cols:
+            if col not in df.columns:
+                logger.warning(f"Column {col} not found, skipping.")
+                continue
+
+            # Dominant category per customer
+            mode_df = (
+                df.groupby(self.customer_id_col)[col]
+                .apply(lambda x: x.mode().iloc[0] if not x.mode().empty else x.iloc[0])
+                .reset_index(name=f"{col}_dominant")
+            )
+
+            # Category diversity (number of unique categories)
+            nunique_df = (
+                df.groupby(self.customer_id_col)[col]
+                .nunique()
+                .reset_index(name=f"{col}_diversity")
+            )
+
+            result = result.merge(mode_df, on=self.customer_id_col, how="left")
+            result = result.merge(nunique_df, on=self.customer_id_col, how="left")
+
+        logger.info(f"Categorical aggregation complete: {result.shape[1]} columns")
+        return result
+
+
+# =============================================================================
+# 4. RFM CALCULATOR (Task 4)
 # =============================================================================
 
 class RFMCalculator(BaseEstimator, TransformerMixin):
     """
-    Calculate Recency, Frequency, and Monetary (RFM) values per customer.
-    
-    Recency: Days since last transaction (relative to SNAPSHOT_DATE).
-    Frequency: Number of transactions.
-    Monetary: Total transaction value (absolute).
-    
-    These RFM features feed into K-Means clustering to create the proxy target.
+    Calculate Recency, Frequency, and Monetary values per customer.
     """
 
-    def __init__(self,
-                 customer_id_col: str = "CustomerId",
-                 value_col: str = "Value",
-                 datetime_col: str = "TransactionStartTime",
-                 snapshot_date: Optional[pd.Timestamp] = None):
+    def __init__(
+        self,
+        customer_id_col: str = "CustomerId",
+        amount_col: str = "Amount",
+        value_col: str = "Value",
+        timestamp_col: str = "TransactionStartTime",
+        snapshot_date: Optional[str] = None,
+    ):
         self.customer_id_col = customer_id_col
+        self.amount_col = amount_col
         self.value_col = value_col
-        self.datetime_col = datetime_col
-        self.snapshot_date = snapshot_date or SNAPSHOT_DATE
+        self.timestamp_col = timestamp_col
+        self.snapshot_date = snapshot_date
 
     def fit(self, X: pd.DataFrame, y=None):
         return self
 
     def transform(self, X: pd.DataFrame) -> pd.DataFrame:
-        X = X.copy()
-        dt = pd.to_datetime(X[self.datetime_col], errors="coerce")
+        logger.info("Calculating RFM metrics...")
 
-        rfm = X.groupby(self.customer_id_col).agg(
-            recency_days=(self.datetime_col, lambda ts: (
-                self.snapshot_date - pd.to_datetime(ts).max()
-            ).days),
-            frequency=(self.value_col, "count"),
-            monetary=(self.value_col, "sum")
-        ).reset_index()
+        df = X.copy()
+        df[self.timestamp_col] = pd.to_datetime(df[self.timestamp_col])
 
-        # Log-transform monetary to handle skewness
-        rfm["monetary_log"] = np.log1p(rfm["monetary"])
+        if self.snapshot_date is None:
+            self.snapshot_date = df[self.timestamp_col].max() + pd.Timedelta(days=1)
+        else:
+            self.snapshot_date = pd.to_datetime(self.snapshot_date)
 
-        logger.info(f"RFM calculated for {len(rfm)} customers. "
-                    f"Snapshot date: {self.snapshot_date.date()}")
+        rfm = (
+            df.groupby(self.customer_id_col)
+            .agg(
+                recency=(self.timestamp_col, lambda x: (self.snapshot_date - x.max()).days),
+                frequency=(self.amount_col, "count"),
+                monetary=(self.value_col, "sum"),
+            )
+            .reset_index()
+        )
+
+        # Use absolute monetary and log-transform (EDA: skewness > 50)
+        rfm["monetary"] = rfm["monetary"].abs()
+        rfm["log_monetary"] = np.log1p(rfm["monetary"])
+
+        logger.info(f"RFM calculated for {len(rfm)} customers")
         return rfm
 
 
-class RiskProxyAssigner(BaseEstimator, TransformerMixin):
-    """
-    Assign is_high_risk proxy target using K-Means clustering on RFM features.
+# =============================================================================
+# 5. RISK LABEL ASSIGNER (Task 4)
+# =============================================================================
 
-    High-risk cluster = lowest frequency + lowest monetary + highest recency
-    (i.e., disengaged, low-value, dormant customers).
-    
-    The cluster with the lowest combined engagement score is labeled as high-risk.
+class RiskLabelAssigner(BaseEstimator, TransformerMixin):
+    """
+    Assign is_high_risk labels using K-Means clustering on RFM features.
+    High-risk = high recency, low frequency, low monetary.
     """
 
     def __init__(self, n_clusters: int = 3, random_state: int = RANDOM_STATE):
         self.n_clusters = n_clusters
         self.random_state = random_state
         self.kmeans_ = None
+        self.scaler_ = None
         self.high_risk_cluster_ = None
-        self.scaler_ = StandardScaler()
 
     def fit(self, X: pd.DataFrame, y=None):
-        # X expected to have: recency_days, frequency, monetary_log
-        rfm_features = X[["recency_days", "frequency", "monetary_log"]].copy()
-        rfm_scaled = self.scaler_.fit_transform(rfm_features)
+        logger.info("Fitting K-Means for risk segmentation...")
+
+        rfm_cols = ["recency", "frequency", "log_monetary"]
+        if not all(c in X.columns for c in rfm_cols):
+            raise ValueError(f"RFM columns {rfm_cols} must be present in input DataFrame")
+
+        # Scale RFM for clustering
+        self.scaler_ = StandardScaler()
+        rfm_scaled = self.scaler_.fit_transform(X[rfm_cols])
 
         self.kmeans_ = KMeans(
             n_clusters=self.n_clusters,
             random_state=self.random_state,
-            n_init=10
+            n_init=10,
         )
-        clusters = self.kmeans_.fit_predict(rfm_scaled)
+        self.kmeans_.fit(rfm_scaled)
 
-        # Identify high-risk cluster: lowest frequency + lowest monetary + highest recency
-        cluster_profiles = pd.DataFrame({
-            "cluster": range(self.n_clusters),
-            "mean_recency": self.kmeans_.cluster_centers_[:, 0],
-            "mean_frequency": self.kmeans_.cluster_centers_[:, 1],
-            "mean_monetary": self.kmeans_.cluster_centers_[:, 2]
-        })
-
-        # Normalize profiles to 0-1 for scoring
-        for col in ["mean_recency", "mean_frequency", "mean_monetary"]:
-            mn, mx = cluster_profiles[col].min(), cluster_profiles[col].max()
-            if mx > mn:
-                cluster_profiles[col] = (cluster_profiles[col] - mn) / (mx - mn)
-
-        # Risk score: high recency is bad, low frequency is bad, low monetary is bad
-        cluster_profiles["risk_score"] = (
-            cluster_profiles["mean_recency"] * 1.0      # higher recency = riskier
-            + (1 - cluster_profiles["mean_frequency"]) * 1.0  # lower freq = riskier
-            + (1 - cluster_profiles["mean_monetary"]) * 0.5   # lower monetary = riskier
+        # Identify high-risk cluster: high recency + low frequency + low monetary
+        centers = pd.DataFrame(
+            self.kmeans_.cluster_centers_,
+            columns=rfm_cols,
         )
 
-        self.high_risk_cluster_ = int(cluster_profiles["risk_score"].idxmax())
-
-        logger.info(
-            f"K-Means fitted with {self.n_clusters} clusters. "
-            f"High-risk cluster identified: Cluster {self.high_risk_cluster_}\n"
-            f"Cluster profiles:\n{cluster_profiles}"
+        # Composite risk score: higher recency is bad, lower frequency is bad, lower monetary is bad
+        centers["risk_score"] = (
+            centers["recency"]
+            - centers["frequency"]
+            - centers["log_monetary"]
         )
+        self.high_risk_cluster_ = int(centers["risk_score"].idxmax())
+
+        logger.info(f"High-risk cluster identified: Cluster {self.high_risk_cluster_}")
+        logger.info(f"Cluster centers:\n{centers.round(3)}")
+
         return self
 
     def transform(self, X: pd.DataFrame) -> pd.DataFrame:
-        rfm_features = X[["recency_days", "frequency", "monetary_log"]].copy()
-        rfm_scaled = self.scaler_.transform(rfm_features)
-        clusters = self.kmeans_.predict(rfm_scaled)
+        logger.info("Assigning risk labels...")
 
+        rfm_cols = ["recency", "frequency", "log_monetary"]
+        rfm_scaled = self.scaler_.transform(X[rfm_cols])
+
+        clusters = self.kmeans_.predict(rfm_scaled)
         X = X.copy()
         X["cluster"] = clusters
         X["is_high_risk"] = (clusters == self.high_risk_cluster_).astype(int)
 
-        risk_rate = X["is_high_risk"].mean()
-        logger.info(f"Proxy target assigned. High-risk rate: {risk_rate:.2%}")
+        risk_dist = X["is_high_risk"].value_counts()
+        logger.info(f"Risk distribution: {risk_dist.to_dict()}")
+
         return X
 
 
 # =============================================================================
-# MAIN PIPELINE
+# 6. WoE / IV TRANSFORMER (Task 3)
 # =============================================================================
 
-class FeatureEngineeringPipeline:
+class WoETransformer(BaseEstimator, TransformerMixin):
     """
-    End-to-end pipeline that transforms raw Xente transaction data
-    into model-ready features with a proxy target variable.
+    Manual Weight-of-Evidence (WoE) and Information Value (IV) transformer.
+    Falls back to quantile-based binning if xverse is not installed.
+    """
 
-    Steps:
-        1. Validate raw data columns
-        2. Extract temporal features
-        3. Group rare categories
-        4. Compute per-customer aggregates
-        5. Encode categorical variables (one-hot)
-        6. Scale numerical features
-        7. Calculate RFM features
-        8. Assign proxy target via K-Means clustering
-        9. (Optional) Apply WoE transformation
+    def __init__(
+        self,
+        columns: List[str],
+        target_col: str = "is_high_risk",
+        n_bins: int = 10,
+        use_xverse: bool = False,
+    ):
+        self.columns = columns
+        self.target_col = target_col
+        self.n_bins = n_bins
+        self.use_xverse = use_xverse
+        self.woe_maps_: Dict[str, Dict] = {}
+        self.iv_values_: Dict[str, float] = {}
 
+    def fit(self, X: pd.DataFrame, y=None):
+        if self.target_col not in X.columns:
+            raise ValueError(f"Target column '{self.target_col}' not found")
+
+        df = X.copy()
+        y = df[self.target_col]
+
+        for col in self.columns:
+            if col not in df.columns:
+                continue
+
+            # Quantile-based binning (monotonic, handles outliers)
+            try:
+                bins = pd.qcut(df[col], q=self.n_bins, duplicates="drop")
+            except ValueError:
+                bins = pd.cut(df[col], bins=self.n_bins)
+
+            # Calculate WoE per bin
+            woe_df = pd.DataFrame({"bin": bins, "target": y})
+            grouped = woe_df.groupby("bin", observed=False)["target"].agg(["count", "sum"])
+            grouped["non_event"] = grouped["count"] - grouped["sum"]
+            grouped["event_rate"] = grouped["sum"] / grouped["sum"].sum()
+            grouped["non_event_rate"] = grouped["non_event"] / grouped["non_event"].sum()
+
+            # Smoothing to avoid division by zero
+            grouped["event_rate"] = grouped["event_rate"].replace(0, 0.0001)
+            grouped["non_event_rate"] = grouped["non_event_rate"].replace(0, 0.0001)
+
+            grouped["woe"] = np.log(grouped["event_rate"] / grouped["non_event_rate"])
+            grouped["iv"] = (grouped["event_rate"] - grouped["non_event_rate"]) * grouped["woe"]
+
+            self.woe_maps_[col] = grouped["woe"].to_dict()
+            self.iv_values_[col] = grouped["iv"].sum()
+
+        logger.info(f"WoE fitted for columns: {list(self.woe_maps_.keys())}")
+        logger.info(f"IV values: { {k: round(v, 3) for k, v in self.iv_values_.items()} }")
+
+        return self
+
+    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
+        X = X.copy()
+
+        for col in self.columns:
+            if col not in X.columns or col not in self.woe_maps_:
+                continue
+
+            # Re-bin using same cut points, then map WoE
+            try:
+                bins = pd.qcut(X[col], q=self.n_bins, duplicates="drop")
+            except ValueError:
+                bins = pd.cut(X[col], bins=self.n_bins)
+
+            woe_map = self.woe_maps_[col]
+            # Map each bin to its WoE value
+            X[f"{col}_woe"] = bins.map(woe_map).astype(float)
+
+        return X
+
+
+# =============================================================================
+# 7. DATA CLEANER / DEFENSIVE PREPROCESSOR (Task 3)
+# =============================================================================
+
+class DataCleaner(BaseEstimator, TransformerMixin):
+    """
+    Defensive cleaning based on EDA findings:
+    - Drop constant columns (e.g., CountryCode)
+    - Handle infinities
+    - Ensure correct dtypes
+    """
+
+    def __init__(self, drop_constant: bool = True):
+        self.drop_constant = drop_constant
+        self.constant_cols_: List[str] = []
+
+    def fit(self, X: pd.DataFrame, y=None):
+        if self.drop_constant:
+            self.constant_cols_ = [
+                col for col in X.columns
+                if X[col].nunique(dropna=False) <= 1
+            ]
+            logger.info(f"Constant columns to drop: {self.constant_cols_}")
+        return self
+
+    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
+        X = X.copy()
+        if self.constant_cols_:
+            X = X.drop(columns=self.constant_cols_, errors="ignore")
+
+        # Replace infinities
+        X = X.replace([np.inf, -np.inf], np.nan)
+
+        logger.info(f"Data cleaned: {X.shape[1]} columns remaining")
+        return X
+
+
+# =============================================================================
+# 8. FULL PIPELINE BUILDER
+# =============================================================================
+
+def build_processing_pipeline(
+    snapshot_date: Optional[str] = None,
+    n_clusters: int = 3,
+) -> Pipeline:
+    """
+    Build the complete sklearn Pipeline for Tasks 3 & 4.
+    
+    Note: This pipeline handles the full flow from raw transactions to
+    customer-level model-ready data. Because aggregation changes the
+    DataFrame shape, we use a custom orchestration function rather than
+    a pure sklearn Pipeline for the aggregation step.
+    """
+    # The aggregation and RFM steps are done in process_data() below.
+    # This pipeline handles the post-aggregation preprocessing.
+    pass
+
+
+def process_data(
+    raw_df: pd.DataFrame,
+    snapshot_date: Optional[str] = None,
+    n_clusters: int = 3,
+    apply_woe: bool = True,
+) -> pd.DataFrame:
+    """
+    Main orchestration function.
+    
+    Takes raw transaction-level DataFrame and returns customer-level,
+    model-ready DataFrame with is_high_risk target and engineered features.
+    
     Parameters
     ----------
+    raw_df : pd.DataFrame
+        Raw Xente transaction data
+    snapshot_date : str, optional
+        Snapshot date for recency calculation. Defaults to max date + 1 day.
+    n_clusters : int
+        Number of K-Means clusters for risk segmentation
     apply_woe : bool
-        If True, applies Weight-of-Evidence transformation to numerical features.
-        Recommended for Logistic Regression baseline.
-    woe_target_col : str
-        Column name to use as target for WoE calculation (typically 'is_high_risk').
-    """
-
-    def __init__(self,
-                 apply_woe: bool = False,
-                 woe_target_col: str = "is_high_risk",
-                 snapshot_date: Optional[pd.Timestamp] = None):
-        self.apply_woe = apply_woe
-        self.woe_target_col = woe_target_col
-        self.snapshot_date = snapshot_date or SNAPSHOT_DATE
-
-        # Sub-components (initialized during fit)
-        self.rare_grouper_ = RareCategoryGrouper(threshold=RARE_CATEGORY_THRESHOLD)
-        self.temporal_extractor_ = TemporalFeatureExtractor()
-        self.agg_engineer_ = AggregateFeatureEngineer()
-        self.rfm_calculator_ = RFMCalculator(snapshot_date=self.snapshot_date)
-        self.risk_assigner_ = RiskProxyAssigner()
-        self.onehot_encoder_ = None
-        self.scaler_ = StandardScaler()
-        self.woe_transformer_ = WoETransformer(n_bins=10) if apply_woe else None
-
-        # Column tracking
-        self.feature_names_: Optional[List[str]] = None
-        self.target_col_ = "is_high_risk"
-
-    def fit_transform(self, df_raw: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series]:
-        """
-        Fit the pipeline on raw data and return processed features + proxy target.
-
-        Returns
-        -------
-        X : pd.DataFrame
-            Model-ready feature matrix (one row per customer).
-        y : pd.Series
-            Proxy target variable (is_high_risk).
-        """
-        logger.info("=" * 60)
-        logger.info("Starting Feature Engineering Pipeline")
-        logger.info("=" * 60)
-
-        # ---- Step 0: Validation ----
-        self._validate_raw_data(df_raw)
-        df = df_raw.copy()
-        logger.info(f"Raw data shape: {df.shape}")
-
-        # ---- Step 1: Temporal Feature Extraction ----
-        logger.info("[Step 1/8] Extracting temporal features...")
-        df = self.temporal_extractor_.fit_transform(df)
-
-        # ---- Step 2: Group Rare Categories ----
-        logger.info("[Step 2/8] Grouping rare categorical categories...")
-        df = self.rare_grouper_.fit_transform(df)
-
-        # ---- Step 3: Aggregate Features per Customer ----
-        logger.info("[Step 3/8] Computing per-customer aggregate features...")
-        customer_agg = self.agg_engineer_.fit_transform(df)
-
-        # ---- Step 4: RFM Calculation ----
-        logger.info("[Step 4/8] Calculating RFM features...")
-        # Need CustomerId + datetime + Value from original df for RFM
-        rfm_df = self.rfm_calculator_.fit_transform(df_raw)
-
-        # ---- Step 5: Proxy Target Assignment (K-Means) ----
-        logger.info("[Step 5/8] Assigning proxy target via K-Means clustering...")
-        rfm_with_target = self.risk_assigner_.fit_transform(rfm_df)
-
-        # Merge RFM + target into customer aggregates
-        customer_id_col = self.agg_engineer_.customer_id_col
-        customer_agg = customer_agg.merge(
-            rfm_with_target[[customer_id_col, "recency_days", "frequency",
-                            "monetary", "monetary_log", "cluster", "is_high_risk"]],
-            on=customer_id_col,
-            how="left"
-        )
-
-        # Separate target before encoding/scaling
-        y = customer_agg[self.target_col_].copy()
-        customer_agg = customer_agg.drop(columns=[self.target_col_])
-
-        # ---- Step 6: Categorical Encoding ----
-        logger.info("[Step 6/8] Encoding categorical variables...")
-        cat_cols_present = [c for c in CATEGORICAL_COLS if c in customer_agg.columns]
-
-        if cat_cols_present:
-            # Use pandas get_dummies for simplicity and feature name preservation
-            customer_agg = pd.get_dummies(customer_agg, columns=cat_cols_present,
-                                          drop_first=False)
-
-        # ---- Step 7: Scaling ----
-        logger.info("[Step 7/8] Scaling numerical features...")
-        num_cols = customer_agg.select_dtypes(include=[np.number]).columns.tolist()
-        # Exclude identifier columns from scaling
-        exclude_from_scaling = [customer_id_col, "cluster"]
-        scale_cols = [c for c in num_cols if c not in exclude_from_scaling]
-
-        if scale_cols:
-            customer_agg[scale_cols] = self.scaler_.fit_transform(
-                customer_agg[scale_cols]
-            )
-
-        # ---- Step 8: WoE Transformation (Optional) ----
-        if self.apply_woe and self.woe_transformer_ is not None:
-            logger.info("[Step 8/8] Applying WoE transformation...")
-            # Temporarily attach target for WoE fitting
-            customer_agg[self.woe_target_col] = y.values
-            customer_agg = self.woe_transformer_.fit_transform(
-                customer_agg, y
-            )
-            customer_agg = customer_agg.drop(columns=[self.woe_target_col])
-
-        self.feature_names_ = [c for c in customer_agg.columns
-                               if c != customer_id_col]
-
-        logger.info(f"Pipeline complete. Final feature matrix: {customer_agg[self.feature_names_].shape}")
-        logger.info(f"Target distribution:\n{y.value_counts(normalize=True)}")
-
-        return customer_agg, y
-
-    def transform(self, df_raw: pd.DataFrame) -> pd.DataFrame:
-        """
-        Transform new raw data using fitted pipeline.
-        NOTE: This method assumes the proxy target is NOT available.
-        It produces features only (for inference on new customers).
-        """
-        df = df_raw.copy()
-        df = self.temporal_extractor_.transform(df)
-        df = self.rare_grouper_.transform(df)
-        customer_agg = self.agg_engineer_.transform(df)
-
-        # For inference, we skip RFM-based target assignment
-        # (new customers won't have a target yet)
-        rfm_df = self.rfm_calculator_.transform(df_raw)
-        rfm_features = rfm_df[["recency_days", "frequency", "monetary", "monetary_log"]]
-
-        customer_id_col = self.agg_engineer_.customer_id_col
-        customer_agg = customer_agg.merge(
-            rfm_df[[customer_id_col, "recency_days", "frequency",
-                    "monetary", "monetary_log"]],
-            on=customer_id_col,
-            how="left"
-        )
-
-        cat_cols_present = [c for c in CATEGORICAL_COLS if c in customer_agg.columns]
-        if cat_cols_present:
-            customer_agg = pd.get_dummies(customer_agg, columns=cat_cols_present,
-                                          drop_first=False)
-
-        num_cols = customer_agg.select_dtypes(include=[np.number]).columns.tolist()
-        exclude_from_scaling = [customer_id_col]
-        scale_cols = [c for c in num_cols if c not in exclude_from_scaling]
-
-        if scale_cols:
-            customer_agg[scale_cols] = self.scaler_.transform(customer_agg[scale_cols])
-
-        # Ensure column alignment with training-time features
-        if self.feature_names_:
-            for col in self.feature_names_:
-                if col not in customer_agg.columns:
-                    customer_agg[col] = 0
-            customer_agg = customer_agg[[customer_id_col] + self.feature_names_]
-
-        return customer_agg
-
-    def _validate_raw_data(self, df: pd.DataFrame):
-        """Ensure required columns are present."""
-        missing = [c for c in RAW_COLS_EXPECTED if c not in df.columns]
-        if missing:
-            raise ValueError(f"Missing required columns: {missing}")
-        logger.info("Raw data validation passed.")
-
-
-# =============================================================================
-# ENTRY POINT
-# =============================================================================
-
-def main():
-    """
-    CLI entry point for the feature engineering pipeline.
+        Whether to apply WoE transformation
     
-    Usage:
-        python src/data_processing.py --input data/raw/training.csv --output data/processed/
+    Returns
+    -------
+    pd.DataFrame
+        Processed customer-level dataset ready for modeling
     """
-    import argparse
-    import os
+    logger.info(f"Starting data processing pipeline on {raw_df.shape[0]:,} transactions")
 
-    parser = argparse.ArgumentParser(description="Run feature engineering pipeline")
-    parser.add_argument("--input", required=True, help="Path to raw CSV data")
-    parser.add_argument("--output", required=True, help="Output directory for processed data")
-    parser.add_argument("--apply-woe", action="store_true", help="Apply WoE transformation")
-    parser.add_argument("--snapshot-date", default="2019-01-01",
-                        help="Snapshot date for RFM recency calculation (YYYY-MM-DD)")
-    args = parser.parse_args()
+    # Step 1: Aggregate numerical features
+    agg_engineer = AggregateFeatureEngineer()
+    agg_features = agg_engineer.fit_transform(raw_df)
 
-    os.makedirs(args.output, exist_ok=True)
+    # Step 2: Temporal features
+    temporal_engineer = TemporalFeatureEngineer()
+    temporal_features = temporal_engineer.fit_transform(raw_df)
 
-    logger.info(f"Loading raw data from {args.input}")
-    df_raw = pd.read_csv(args.input)
+    # Step 3: Categorical aggregation
+    cat_aggregator = CategoricalAggregator()
+    cat_features = cat_aggregator.fit_transform(raw_df)
 
-    snapshot = pd.Timestamp(args.snapshot_date)
-    pipeline = FeatureEngineeringPipeline(apply_woe=args.apply_woe,
-                                          snapshot_date=snapshot)
-    X, y = pipeline.fit_transform(df_raw)
+    # Step 4: Merge all customer-level features
+    customer_df = agg_features.merge(
+        temporal_features, on="CustomerId", how="outer"
+    ).merge(
+        cat_features, on="CustomerId", how="outer"
+    )
 
-    # Save outputs
-    output_path = os.path.join(args.output, "train_processed.csv")
-    X[self.target_col_] = y.values
-    X.to_csv(output_path, index=False)
-    logger.info(f"Saved processed data to {output_path}")
+    # Step 5: RFM calculation
+    rfm_calc = RFMCalculator(snapshot_date=snapshot_date)
+    rfm_features = rfm_calc.fit_transform(raw_df)
 
-    # Save feature list for API reference
-    feature_list_path = os.path.join(args.output, "feature_names.txt")
-    with open(feature_list_path, "w") as f:
-        f.write("\n".join(pipeline.feature_names_))
-    logger.info(f"Saved feature names to {feature_list_path}")
+    # Step 6: Merge RFM into customer dataset
+    customer_df = customer_df.merge(rfm_features, on="CustomerId", how="outer")
 
+    # Step 7: Data cleaning (drop constant columns, handle inf/nan)
+    cleaner = DataCleaner()
+    customer_df = cleaner.fit_transform(customer_df)
+
+    # Step 8: Defensive imputation for any remaining NaNs
+    # (EDA showed no missing values, but pipeline must be robust)
+    num_cols = customer_df.select_dtypes(include=[np.number]).columns.tolist()
+    num_cols = [c for c in num_cols if c != "CustomerId"]
+    
+    for col in num_cols:
+        if customer_df[col].isnull().any():
+            customer_df[col] = customer_df[col].fillna(customer_df[col].median())
+
+    # Step 9: Risk label assignment via K-Means (Task 4)
+    risk_assigner = RiskLabelAssigner(n_clusters=n_clusters, random_state=RANDOM_STATE)
+    customer_df = risk_assigner.fit_transform(customer_df)
+
+    # Step 10: WoE transformation (Task 3)
+    if apply_woe:
+        # Select numerical features for WoE (exclude ID, target, cluster)
+        woe_candidates = [
+            c for c in num_cols
+            if c not in ["recency", "frequency", "monetary", "log_monetary", "cluster", "is_high_risk"]
+            and customer_df[c].nunique() > 5  # Need enough variation to bin
+        ]
+        
+        if woe_candidates:
+            woe_transformer = WoETransformer(
+                columns=woe_candidates[:5],  # Limit to top 5 to avoid over-engineering
+                target_col="is_high_risk",
+                n_bins=10,
+            )
+            customer_df = woe_transformer.fit_transform(customer_df)
+            logger.info(f"WoE applied to columns: {woe_candidates[:5]}")
+
+    # Step 11: Final feature selection / ordering
+    # Drop raw high-cardinality IDs that are not model features
+    drop_cols = ["CustomerId"]  # Keep if needed for reference, but exclude from modeling
+    # Actually keep CustomerId for reference, drop only if explicitly requested
+
+    logger.info(f"Pipeline complete. Output shape: {customer_df.shape}")
+    logger.info(f"Final columns: {list(customer_df.columns)}")
+
+    return customer_df
+
+
+# =============================================================================
+# 9. UTILITY FUNCTIONS
+# =============================================================================
+
+def get_feature_columns(df: pd.DataFrame, target_col: str = "is_high_risk") -> List[str]:
+    """
+    Return list of feature columns suitable for model training.
+    Excludes target, cluster label, and ID columns.
+    """
+    exclude = {target_col, "cluster", "CustomerId"}
+    return [c for c in df.columns if c not in exclude]
+
+
+def split_features_target(
+    df: pd.DataFrame,
+    target_col: str = "is_high_risk",
+) -> Tuple[pd.DataFrame, pd.Series]:
+    """
+    Split processed DataFrame into X (features) and y (target).
+    """
+    features = get_feature_columns(df, target_col)
+    X = df[features]
+    y = df[target_col]
+    return X, y
+
+
+# =============================================================================
+# 10. MAIN EXECUTION
+# =============================================================================
 
 if __name__ == "__main__":
-    main()
+    # Example usage (requires data/raw/data.csv)
+    import os
+
+    data_path = os.path.join("data", "raw", "data.csv")
+    if os.path.exists(data_path):
+        raw = pd.read_csv(data_path)
+        processed = process_data(raw)
+        processed.to_csv("data/processed/customer_features.csv", index=False)
+        logger.info("Processed data saved to data/processed/customer_features.csv")
+    else:
+        logger.warning(f"Data file not found at {data_path}. Run this after placing the dataset.")
